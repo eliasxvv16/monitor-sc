@@ -30,7 +30,19 @@ MONITORED_URL = "http://localhost"
 
 # Obtener información de la máquina
 HOSTNAME = socket.gethostname()
-IP_ADDRESS = socket.gethostbyname(HOSTNAME)
+
+def get_private_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+IP_ADDRESS = get_private_ip()
 
 # ==========================
 # UTILS
@@ -65,11 +77,10 @@ def detect_logs():
 # ==========================
 
 def run_sudo(cmd, password):
-    # Crear script temporal para SUDO_ASKPASS
     fd, path = tempfile.mkstemp()
     with os.fdopen(fd, 'w') as f:
         f.write(f"#!/bin/sh\necho '{password}'\n")
-    os.chmod(path, stat.S_IRWXU)  # Ejecutable solo para el usuario
+    os.chmod(path, stat.S_IRWXU)
 
     env = os.environ.copy()
     env["SUDO_ASKPASS"] = path
@@ -149,7 +160,6 @@ class ApacheMonitor(App):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Pedir contraseña sudo al inicio
         self.sudo_password = getpass.getpass("Contraseña sudo: ")
 
     def compose(self) -> ComposeResult:
