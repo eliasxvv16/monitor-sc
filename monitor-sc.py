@@ -24,8 +24,8 @@ LOG_PATHS = [
     ("/var/log/httpd/access_log", "/var/log/httpd/error_log"),
 ]
 BASE_DIR = pathlib.Path(__file__).parent
-AUTO_LOG = BASE_DIR / "registro-auto.txt"
-MANUAL_LOG = BASE_DIR / "registro-manual.txt"
+AUTO_LOG = BASE_DIR / "registro-auto.log"
+MANUAL_LOG = BASE_DIR / "registro-manual.log"
 MONITORED_URL = "http://localhost"
 
 # Obtener información de la máquina
