@@ -1,4 +1,24 @@
 #!/usr/bin/env python3
+"""
+================================================================================
+Monitorización de Servicio Apache en Linux
+================================================================================
+Autor: [Elias Halloumi El amraoui]
+Fecha: 2025-12-20
+Descripción: 
+    Script de monitorización de un servicio web (Apache) y recursos del sistema.
+    Permite:
+      - Modo manual: menú interactivo usando Textual
+      - Modo automático: ejecutable mediante cron, genera logs en JSON
+    Funcionalidades:
+      - Estado del servicio Apache
+      - Puertos escuchando (ej. 80)
+      - HTTP status y tiempo de respuesta
+      - Recursos del sistema: CPU, RAM, Disco
+      - Logs automáticos y manuales en /var/log/monitor-sc
+================================================================================
+"""
+
 # ==========================
 # IMPORTS
 # ==========================
@@ -21,23 +41,26 @@ import stat
 import json
 
 # ==========================
-# CONFIG
+# CONFIGURACIÓN GENERAL
 # ==========================
-SERVICES = ["apache2", "httpd"]
-LOG_PATHS = [
+SERVICES = ["apache2", "httpd"]  # servicios Apache posibles
+LOG_PATHS = [                     # posibles rutas de logs Apache
     ("/var/log/apache2/access.log", "/var/log/apache2/error.log"),
     ("/var/log/httpd/access_log", "/var/log/httpd/error_log"),
 ]
 
-BASE_DIR = pathlib.Path(__file__).parent
-AUTO_LOG = BASE_DIR / "registro-auto.log"
-MANUAL_LOG = BASE_DIR / "registro-manual.log"
+# Carpeta de logs centralizada en /var/log/monitor-sc
+LOG_DIR = pathlib.Path("/var/log/monitor-sc")
+LOG_DIR.mkdir(parents=True, exist_ok=True)  # crea carpeta si no existe
+AUTO_LOG = LOG_DIR / "registro-auto.log"
+MANUAL_LOG = LOG_DIR / "registro-manual.log"
 
+# URL a monitorizar
 MONITORED_URL = "http://localhost"
 
-HOSTNAME = socket.gethostname()
+HOSTNAME = socket.gethostname()  # nombre de la máquina
 
-
+# Obtener IP privada de la máquina
 def get_private_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -49,20 +72,20 @@ def get_private_ip():
         s.close()
     return ip
 
-
 IP_ADDRESS = get_private_ip()
 
 # ==========================
-# UTILS
+# FUNCIONES ÚTILES
 # ==========================
 def run_cmd(cmd):
+    """Ejecuta un comando de Linux y devuelve la salida como texto."""
     try:
         return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
     except subprocess.CalledProcessError as e:
         return e.output
 
-
 def detect_apache():
+    """Detecta qué servicio Apache está activo."""
     for service in SERVICES:
         if subprocess.run(
             ["systemctl", "status", service],
@@ -72,17 +95,18 @@ def detect_apache():
             return service
     return None
 
-
 def detect_logs():
+    """Detecta rutas de logs disponibles según el servicio Apache."""
     for access, error in LOG_PATHS:
         if os.path.exists(error):
             return access, error
     return None, None
 
 # ==========================
-# SUDO UTILS (SOLO MANUAL)
+# FUNCIONES CON SUDO (SOLO MODO MANUAL)
 # ==========================
 def run_sudo(cmd, password):
+    """Ejecuta un comando con sudo usando la contraseña proporcionada."""
     fd, path = tempfile.mkstemp()
     with os.fdopen(fd, 'w') as f:
         f.write(f"#!/bin/sh\necho '{password}'\n")
@@ -103,9 +127,10 @@ def run_sudo(cmd, password):
         os.remove(path)
 
 # ==========================
-# LOG CLEANUP
+# LOGS
 # ==========================
 def clean_log_file(path: pathlib.Path, max_age: timedelta):
+    """Limpia registros JSON antiguos según edad máxima."""
     if not path.exists():
         return
     now = datetime.now()
@@ -122,21 +147,21 @@ def clean_log_file(path: pathlib.Path, max_age: timedelta):
     with open(path, "w") as f:
         f.writelines(valid_lines)
 
-
 def clean_old_logs():
+    """Limpia logs antiguos: Auto 7 días, Manual no se limpia."""
     clean_log_file(AUTO_LOG, timedelta(days=7))
-    # manual es texto plano, no se limpia aquí
-
 
 def write_manual_log(action: str):
+    """Escribe una entrada en el log manual."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(MANUAL_LOG, "a") as f:
         f.write(f"{now} - {HOSTNAME} ({IP_ADDRESS}) - {action}\n")
 
 # ==========================
-# AUTO MODE (CRON)
+# MODO AUTOMÁTICO (CRON)
 # ==========================
 def run_auto_checks():
+    """Ejecuta todas las comprobaciones en modo automático y genera log JSON."""
     timestamp = datetime.now().isoformat()
     service = detect_apache()
 
@@ -148,7 +173,7 @@ def run_auto_checks():
         "final_status": "OK"
     }
 
-    # ---- Servicio ----
+    # Estado del servicio
     if service:
         active = subprocess.run(
             ["systemctl", "is-active", service],
@@ -162,16 +187,15 @@ def run_auto_checks():
         results["checks"]["service"] = "not_found"
         results["final_status"] = "CRIT"
 
-    # ---- Puerto 80 ----
+    # Puerto 80
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     port_open = sock.connect_ex(("127.0.0.1", 80)) == 0
     sock.close()
-
     results["checks"]["port_80"] = "open" if port_open else "closed"
     if not port_open:
         results["final_status"] = "CRIT"
 
-    # ---- HTTP ----
+    # HTTP
     try:
         r = requests.get(MONITORED_URL, timeout=5)
         results["checks"]["http"] = {
@@ -186,7 +210,7 @@ def run_auto_checks():
         results["checks"]["http"] = "error"
         results["final_status"] = "CRIT"
 
-    # ---- Recursos ----
+    # Recursos del sistema
     cpu = psutil.cpu_percent(interval=1)
     mem = psutil.virtual_memory().percent
     disk = psutil.disk_usage('/').percent
@@ -201,24 +225,25 @@ def run_auto_checks():
         if results["final_status"] != "CRIT":
             results["final_status"] = "WARN"
 
+    # Guardar log JSON
     with open(AUTO_LOG, "a") as f:
         f.write(json.dumps(results) + "\n")
 
 # ==========================
-# TEXTUAL APP (MANUAL)
+# MODO MANUAL (INTERACTIVO) - TEXTUAL
 # ==========================
 class OutputPanel(Static):
+    """Panel de salida para mostrar resultados en el menú."""
     pass
 
-
 def make_item(label):
+    """Crea un item para el menú interactivo."""
     widget = Static(label)
     widget.label = label
     return ListItem(widget)
 
-
 class ApacheMonitor(App):
-
+    """Aplicación TUI para monitoreo manual."""
     CSS = """
     Screen { background: black; }
     ListView { width: 28%; border: solid green; background: #0b0b0b; }
@@ -271,6 +296,7 @@ class ApacheMonitor(App):
         self.output.update(self.handle_option(option))
 
     def handle_option(self, option):
+        """Procesa cada opción del menú manual."""
         if not self.apache_service:
             return "Apache no disponible"
 
@@ -278,29 +304,22 @@ class ApacheMonitor(App):
 
         if option == "Estado del servicio":
             return run_cmd(["systemctl", "status", self.apache_service, "--no-pager"])
-
         if option == "Reload Apache":
             run_sudo(["systemctl", "reload", self.apache_service], self.sudo_password)
             return "✔ Apache recargado"
-
         if option == "Restart Apache":
             run_sudo(["systemctl", "restart", self.apache_service], self.sudo_password)
             return "✔ Apache reiniciado"
-
         if option == "Uptime":
             return run_cmd(["systemctl", "show", self.apache_service, "--property=ActiveEnterTimestamp"])
-
         if option == "Puertos escuchando":
             return run_sudo(["ss", "-lntp"], self.sudo_password)
-
         if option == "Uso de disco":
             return run_cmd(["df", "-h"])
-
         if option == "Logs (error.log)":
             if self.error_log:
                 return run_cmd(["tail", "-n", "30", self.error_log])
             return "No se encontró error.log"
-
         if option == "Recursos y HTTP":
             result = []
             try:
@@ -308,20 +327,17 @@ class ApacheMonitor(App):
                 result.append(f"HTTP {r.status_code} ({r.elapsed.total_seconds():.2f}s)")
             except Exception as e:
                 result.append(f"HTTP ERROR ({e})")
-
             cpu = psutil.cpu_percent(interval=1)
             mem = psutil.virtual_memory().percent
             disk = psutil.disk_usage('/').percent
-
             result.append(f"CPU: {cpu}%")
             result.append(f"RAM: {mem}%")
             result.append(f"Disco /: {disk}%")
-
             return "\n".join(result)
-
         return "Opción no válida"
 
     def action_refresh(self):
+        """Refresca el estado del servicio en el panel."""
         if self.apache_service:
             self.output.update(run_cmd(["systemctl", "status", self.apache_service, "--no-pager"]))
         else:
