@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
+# ==========================
+# IMPORTS
+# ==========================
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, ListView, ListItem
 from textual.containers import Horizontal
 from textual.reactive import reactive
 
+import argparse
 import subprocess
 import os
 import pathlib
@@ -14,6 +18,7 @@ import requests
 import socket
 import tempfile
 import stat
+import json
 
 # ==========================
 # CONFIG
@@ -23,13 +28,15 @@ LOG_PATHS = [
     ("/var/log/apache2/access.log", "/var/log/apache2/error.log"),
     ("/var/log/httpd/access_log", "/var/log/httpd/error_log"),
 ]
+
 BASE_DIR = pathlib.Path(__file__).parent
 AUTO_LOG = BASE_DIR / "registro-auto.log"
 MANUAL_LOG = BASE_DIR / "registro-manual.log"
+
 MONITORED_URL = "http://localhost"
 
-# Obtener información de la máquina
 HOSTNAME = socket.gethostname()
+
 
 def get_private_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -42,12 +49,12 @@ def get_private_ip():
         s.close()
     return ip
 
+
 IP_ADDRESS = get_private_ip()
 
 # ==========================
 # UTILS
 # ==========================
-
 def run_cmd(cmd):
     try:
         return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
@@ -73,9 +80,8 @@ def detect_logs():
     return None, None
 
 # ==========================
-# SUDO UTILS
+# SUDO UTILS (SOLO MANUAL)
 # ==========================
-
 def run_sudo(cmd, password):
     fd, path = tempfile.mkstemp()
     with os.fdopen(fd, 'w') as f:
@@ -87,26 +93,18 @@ def run_sudo(cmd, password):
     env["DISPLAY"] = "dummy"
 
     try:
-        return subprocess.check_output(["sudo", "-A"] + cmd, stderr=subprocess.STDOUT, text=True, env=env)
+        return subprocess.check_output(
+            ["sudo", "-A"] + cmd,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env
+        )
     finally:
         os.remove(path)
 
 # ==========================
-# LOGGING
+# LOG CLEANUP
 # ==========================
-
-def write_auto_log():
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(AUTO_LOG, "a") as f:
-        f.write(f"{now} - {HOSTNAME} ({IP_ADDRESS}) - Script ejecutado en modo AUTO\n")
-
-
-def write_manual_log(action: str):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(MANUAL_LOG, "a") as f:
-        f.write(f"{now} - {HOSTNAME} ({IP_ADDRESS}) - {action}\n")
-
-
 def clean_log_file(path: pathlib.Path, max_age: timedelta):
     if not path.exists():
         return
@@ -115,8 +113,8 @@ def clean_log_file(path: pathlib.Path, max_age: timedelta):
     with open(path, "r") as f:
         for line in f:
             try:
-                date_str = line.split(" - ")[0]
-                log_date = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                data = json.loads(line)
+                log_date = datetime.fromisoformat(data["timestamp"])
                 if now - log_date <= max_age:
                     valid_lines.append(line)
             except Exception:
@@ -127,10 +125,87 @@ def clean_log_file(path: pathlib.Path, max_age: timedelta):
 
 def clean_old_logs():
     clean_log_file(AUTO_LOG, timedelta(days=7))
-    clean_log_file(MANUAL_LOG, timedelta(days=1))
+    # manual es texto plano, no se limpia aquí
+
+
+def write_manual_log(action: str):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(MANUAL_LOG, "a") as f:
+        f.write(f"{now} - {HOSTNAME} ({IP_ADDRESS}) - {action}\n")
 
 # ==========================
-# WIDGETS
+# AUTO MODE (CRON)
+# ==========================
+def run_auto_checks():
+    timestamp = datetime.now().isoformat()
+    service = detect_apache()
+
+    results = {
+        "timestamp": timestamp,
+        "hostname": HOSTNAME,
+        "ip": IP_ADDRESS,
+        "checks": {},
+        "final_status": "OK"
+    }
+
+    # ---- Servicio ----
+    if service:
+        active = subprocess.run(
+            ["systemctl", "is-active", service],
+            stdout=subprocess.PIPE,
+            text=True
+        ).stdout.strip()
+        results["checks"]["service"] = active
+        if active != "active":
+            results["final_status"] = "CRIT"
+    else:
+        results["checks"]["service"] = "not_found"
+        results["final_status"] = "CRIT"
+
+    # ---- Puerto 80 ----
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    port_open = sock.connect_ex(("127.0.0.1", 80)) == 0
+    sock.close()
+
+    results["checks"]["port_80"] = "open" if port_open else "closed"
+    if not port_open:
+        results["final_status"] = "CRIT"
+
+    # ---- HTTP ----
+    try:
+        r = requests.get(MONITORED_URL, timeout=5)
+        results["checks"]["http"] = {
+            "code": r.status_code,
+            "time": round(r.elapsed.total_seconds(), 3)
+        }
+        if r.status_code >= 500:
+            results["final_status"] = "CRIT"
+        elif r.status_code >= 400 and results["final_status"] != "CRIT":
+            results["final_status"] = "WARN"
+    except Exception:
+        results["checks"]["http"] = "error"
+        results["final_status"] = "CRIT"
+
+    # ---- Recursos ----
+    cpu = psutil.cpu_percent(interval=1)
+    mem = psutil.virtual_memory().percent
+    disk = psutil.disk_usage('/').percent
+
+    results["checks"]["cpu"] = cpu
+    results["checks"]["ram"] = mem
+    results["checks"]["disk"] = disk
+
+    if cpu > 95 or mem > 95 or disk > 95:
+        results["final_status"] = "CRIT"
+    elif cpu > 80 or mem > 80 or disk > 90:
+        if results["final_status"] != "CRIT":
+            results["final_status"] = "WARN"
+
+    with open(AUTO_LOG, "a") as f:
+        f.write(json.dumps(results) + "\n")
+
+# ==========================
+# TEXTUAL APP (MANUAL)
 # ==========================
 class OutputPanel(Static):
     pass
@@ -141,9 +216,7 @@ def make_item(label):
     widget.label = label
     return ListItem(widget)
 
-# ==========================
-# APP
-# ==========================
+
 class ApacheMonitor(App):
 
     CSS = """
@@ -208,11 +281,11 @@ class ApacheMonitor(App):
 
         if option == "Reload Apache":
             run_sudo(["systemctl", "reload", self.apache_service], self.sudo_password)
-            return "✔ Apache recargado correctamente"
+            return "✔ Apache recargado"
 
         if option == "Restart Apache":
             run_sudo(["systemctl", "restart", self.apache_service], self.sudo_password)
-            return "✔ Apache reiniciado correctamente"
+            return "✔ Apache reiniciado"
 
         if option == "Uptime":
             return run_cmd(["systemctl", "show", self.apache_service, "--property=ActiveEnterTimestamp"])
@@ -232,21 +305,18 @@ class ApacheMonitor(App):
             result = []
             try:
                 r = requests.get(MONITORED_URL, timeout=5)
-                result.append(f"HTTP {MONITORED_URL}: {r.status_code} ({r.elapsed.total_seconds():.2f}s)")
+                result.append(f"HTTP {r.status_code} ({r.elapsed.total_seconds():.2f}s)")
             except Exception as e:
-                result.append(f"HTTP {MONITORED_URL}: ERROR ({e})")
-            cpu_percent = psutil.cpu_percent(interval=1)
-            result.append(f"CPU: {cpu_percent}%")
-            mem = psutil.virtual_memory()
-            result.append(f"RAM: {mem.percent}% de uso")
-            disk = psutil.disk_usage('/')
-            result.append(f"Disco /: {disk.percent}% de uso")
-            status = "OK"
-            if cpu_percent > 80 or mem.percent > 80 or disk.percent > 90 or (r.status_code >= 400 if 'r' in locals() else False):
-                status = "WARN"
-            if cpu_percent > 95 or mem.percent > 95 or disk.percent > 95 or (r.status_code >= 500 if 'r' in locals() else False):
-                status = "CRIT"
-            result.append(f"Estado final: {status}")
+                result.append(f"HTTP ERROR ({e})")
+
+            cpu = psutil.cpu_percent(interval=1)
+            mem = psutil.virtual_memory().percent
+            disk = psutil.disk_usage('/').percent
+
+            result.append(f"CPU: {cpu}%")
+            result.append(f"RAM: {mem}%")
+            result.append(f"Disco /: {disk}%")
+
             return "\n".join(result)
 
         return "Opción no válida"
@@ -261,6 +331,16 @@ class ApacheMonitor(App):
 # MAIN
 # ==========================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Apache Monitor")
+    parser.add_argument("--auto", action="store_true", help="Modo automático (cron)")
+    parser.add_argument("--menu", action="store_true", help="Modo manual interactivo")
+    args = parser.parse_args()
+
     clean_old_logs()
-    write_auto_log()
-    ApacheMonitor().run()
+
+    if args.auto:
+        # ===== MODO AUTOMÁTICO (CRON) =====
+        run_auto_checks()
+    else:
+        # ===== MODO MANUAL (USUARIO) =====
+        ApacheMonitor().run()
